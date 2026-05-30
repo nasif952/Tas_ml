@@ -71,16 +71,26 @@ def mask_s2_clouds(img):
 
 def get_s2_existing_water(region, config: FloodConfig):
     import ee
-    s2 = (
+
+    s2_col = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(region)
         .filterDate(config.s2_water_start, config.s2_water_end)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", config.s2_cloud_pct))
         .map(mask_s2_clouds)
-        .median()
-        .clip(region)
+        .select(["B3", "B8"])
     )
-    ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI")
+
+    # If Sentinel-2 has no valid images for the chosen cloud/date window, keep
+    # the pipeline alive with a no-existing-water fallback. This is safer than
+    # crashing during NDWI creation.
+    fallback_s2 = ee.Image.constant([0, 0]).rename(["B3", "B8"]).clip(region).toFloat()
+    safe_s2_col = ee.ImageCollection(
+        ee.Algorithms.If(s2_col.size().gt(0), s2_col, ee.ImageCollection([fallback_s2]))
+    )
+
+    s2 = safe_s2_col.median().clip(region)
+    ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI").unmask(-9999)
     existing_water = ndwi.gt(config.ndwi_threshold).rename("Existing_Water")
     return ndwi, existing_water
 
@@ -107,49 +117,111 @@ def build_persistence(stage1_vv, stage2_vv, flood_map, config: FloodConfig):
     return vv_change, stuck_water, persistence
 
 
+def _constant_band(region, name: str, value: float = -9999):
+    import ee
+    return ee.Image.constant(value).clip(region).rename(name).toFloat()
+
+
+def _safe_single_band_collection(raw_col, fallback_img):
+    import ee
+    return ee.ImageCollection(
+        ee.Algorithms.If(raw_col.size().gt(0), raw_col, ee.ImageCollection([fallback_img]))
+    )
+
+
 def build_predictors(region, config: FloodConfig):
     import ee
-    dem = ee.Image("USGS/SRTMGL1_003").clip(region).rename("elevation")
-    slope = ee.Terrain.slope(dem).rename("slope")
-    twi = ee.Image(1).divide(slope.multiply(3.141592653589793).divide(180).tan().add(0.001)).log().rename("TWI_simple")
+    dem = ee.Image("USGS/SRTMGL1_003").clip(region).rename("elevation").toFloat()
+    slope = ee.Terrain.slope(dem).rename("slope").toFloat()
+    twi = (
+        ee.Image(1)
+        .divide(slope.multiply(3.141592653589793).divide(180).tan().add(0.001))
+        .log()
+        .rename("TWI_simple")
+        .toFloat()
+    )
 
-    modis = (
+    extra_layers: Dict[str, object] = {}
+    availability = {}
+
+    modis_raw = (
         ee.ImageCollection("MODIS/061/MOD09A1")
         .filterBounds(region)
         .filterDate(config.predictor_start, config.predictor_end)
+        .select(["sur_refl_b01", "sur_refl_b02", "sur_refl_b06"])
+    )
+    availability["modis_surface_reflectance_count"] = modis_raw.size()
+    modis_fallback = (
+        ee.Image.constant([0, 0, 0])
+        .rename(["sur_refl_b01", "sur_refl_b02", "sur_refl_b06"])
+        .clip(region)
+        .toFloat()
+    )
+    modis = (
+        ee.ImageCollection(
+            ee.Algorithms.If(modis_raw.size().gt(0), modis_raw, ee.ImageCollection([modis_fallback]))
+        )
         .median()
         .clip(region)
         .multiply(0.0001)
     )
-    ndvi = modis.normalizedDifference(["sur_refl_b02", "sur_refl_b01"]).rename("NDVI")
-    ndbi = modis.normalizedDifference(["sur_refl_b06", "sur_refl_b02"]).rename("NDBI")
+    ndvi = modis.normalizedDifference(["sur_refl_b02", "sur_refl_b01"]).rename("NDVI").unmask(-9999)
+    ndbi = modis.normalizedDifference(["sur_refl_b06", "sur_refl_b02"]).rename("NDBI").unmask(-9999)
 
-    precipitation = (
+    precipitation_raw = (
         ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
         .filterBounds(region)
         .filterDate(config.month_start, config.month_end)
+        .select("precipitation")
+    )
+    availability["monthly_chirps_count"] = precipitation_raw.size()
+    precipitation = (
+        _safe_single_band_collection(
+            precipitation_raw,
+            _constant_band(region, "precipitation", -9999),
+        )
         .sum()
         .clip(region)
         .rename("precipitation")
+        .toFloat()
     )
-    event_rainfall = (
+
+    event_rainfall_raw = (
         ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
         .filterBounds(region)
         .filterDate(config.event_rain_start, config.event_rain_end)
+        .select("precipitation")
+    )
+    availability["event_chirps_count"] = event_rainfall_raw.size()
+    event_rainfall = (
+        _safe_single_band_collection(
+            event_rainfall_raw,
+            _constant_band(region, "event_rainfall", -9999),
+        )
         .sum()
         .clip(region)
         .rename("event_rainfall")
+        .toFloat()
     )
-    temperature = (
+
+    temperature_raw = (
         ee.ImageCollection("MODIS/061/MOD11A2")
         .filterBounds(region)
         .filterDate(config.month_start, config.month_end)
         .select("LST_Day_1km")
+    )
+    availability["modis_lst_count"] = temperature_raw.size()
+    temperature = (
+        _safe_single_band_collection(
+            temperature_raw,
+            _constant_band(region, "LST_Day_1km", -9999),
+        )
         .mean()
         .multiply(0.02)
         .subtract(273.15)
         .clip(region)
         .rename("temperature")
+        .toFloat()
     )
 
     predictor_names: List[str] = [
@@ -157,15 +229,30 @@ def build_predictors(region, config: FloodConfig):
         "precipitation", "event_rainfall", "temperature"
     ]
 
-    predictors = dem.addBands(slope).addBands(twi).addBands(ndvi).addBands(ndbi).addBands(precipitation).addBands(event_rainfall).addBands(temperature)
-
-    extra_layers: Dict[str, object] = {}
+    predictors = (
+        dem.addBands(slope)
+        .addBands(twi)
+        .addBands(ndvi)
+        .addBands(ndbi)
+        .addBands(precipitation)
+        .addBands(event_rainfall)
+        .addBands(temperature)
+    )
 
     if config.use_river_distance:
         rivers = ee.FeatureCollection(config.river_asset).filterBounds(region)
-        river_raster = ee.Image().byte().paint(featureCollection=rivers, color=1).clip(region)
-        river_distance = river_raster.fastDistanceTransform(1024).sqrt().multiply(ee.Image.pixelArea().sqrt()).clip(region).rename("river_distance_m")
-        river_distance_1km = river_distance.min(config.river_distance_cap_m).rename("river_distance_1km")
+        availability["river_feature_count"] = rivers.size()
+        river_raster = ee.Image().byte().paint(featureCollection=rivers, color=1).unmask(0).clip(region)
+        river_distance = (
+            river_raster
+            .fastDistanceTransform(1024)
+            .sqrt()
+            .multiply(ee.Image.pixelArea().sqrt())
+            .clip(region)
+            .rename("river_distance_m")
+            .toFloat()
+        )
+        river_distance_1km = river_distance.min(config.river_distance_cap_m).rename("river_distance_1km").toFloat()
         river_buffer = river_distance.lte(config.river_distance_cap_m).rename("river_buffer")
         predictors = predictors.addBands(river_distance_1km)
         predictor_names.append("river_distance_1km")
@@ -174,25 +261,41 @@ def build_predictors(region, config: FloodConfig):
         extra_layers["river_buffer"] = river_buffer
 
     if config.use_soil_moisture:
-        soil_moisture = (
+        smap_raw = (
             ee.ImageCollection("NASA/SMAP/SPL4SMGP/007")
             .filterBounds(region)
             .filterDate(config.soil_start, config.soil_end)
             .select("sm_surface")
+        )
+        availability["smap_soil_moisture_count"] = smap_raw.size()
+        soil_moisture = (
+            _safe_single_band_collection(
+                smap_raw,
+                _constant_band(region, "sm_surface", -9999),
+            )
             .mean()
             .clip(region)
             .rename("soil_moisture")
+            .toFloat()
         )
         predictors = predictors.addBands(soil_moisture)
         predictor_names.append("soil_moisture")
         extra_layers["soil_moisture"] = soil_moisture
 
-    return predictors.unmask(-9999), predictor_names, extra_layers
+    predictors = predictors.select(predictor_names).unmask(-9999).toFloat()
+    extra_layers["availability"] = ee.Dictionary(availability)
+    return predictors, predictor_names, extra_layers
 
 
 def train_rf_susceptibility(region, predictors, label, predictor_names: List[str], config: FloodConfig):
     import ee
-    stack = predictors.addBands(label.unmask(0).toInt().rename("label"))
+
+    # Always select and unmask predictors before sampling. This prevents
+    # missing-property crashes such as:
+    # "Property 'soil_moisture' of feature '0' is missing."
+    clean_predictors = predictors.select(predictor_names).unmask(-9999).toFloat()
+    stack = clean_predictors.addBands(label.unmask(0).toInt().rename("label"))
+
     samples = stack.stratifiedSample(
         numPoints=0,
         classBand="label",
@@ -204,6 +307,23 @@ def train_rf_susceptibility(region, predictors, label, predictor_names: List[str
         geometries=True,
         dropNulls=False,
     )
+
+    predictor_list = ee.List(predictor_names)
+
+    def fill_missing_properties(feature):
+        feature = ee.Feature(feature)
+        original_names = feature.propertyNames()
+
+        def set_one_property(name, accumulator):
+            name = ee.String(name)
+            accumulator = ee.Feature(accumulator)
+            value = ee.Algorithms.If(original_names.contains(name), accumulator.get(name), -9999)
+            return accumulator.set(name, value)
+
+        return ee.Feature(predictor_list.iterate(set_one_property, feature))
+
+    samples = samples.map(fill_missing_properties)
+
     random_samples = samples.randomColumn("random", config.seed)
     training = random_samples.filter(ee.Filter.lt("random", config.train_fraction))
     testing = random_samples.filter(ee.Filter.gte("random", config.train_fraction))
@@ -226,7 +346,7 @@ def train_rf_susceptibility(region, predictors, label, predictor_names: List[str
         classProperty="label",
         inputProperties=predictor_names,
     )
-    susceptibility = predictors.select(predictor_names).classify(rf_probability).rename("Flood_Susceptibility")
+    susceptibility = clean_predictors.classify(rf_probability).rename("Flood_Susceptibility")
 
     return {
         "samples": samples,
@@ -252,4 +372,5 @@ def area_km2(image, band: str, region, scale: int):
     area = image.selfMask().multiply(ee.Image.pixelArea()).reduceRegion(
         reducer=ee.Reducer.sum(), geometry=region, scale=scale, maxPixels=1e13
     )
-    return ee.Number(area.get(band)).divide(1e6)
+    value = ee.Number(ee.Algorithms.If(area.get(band), area.get(band), 0))
+    return value.divide(1e6)
