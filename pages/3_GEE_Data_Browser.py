@@ -14,13 +14,21 @@ import ee
 
 @st.cache_data(ttl=300, show_spinner=False)
 def list_assets(parent: str, limit: int = 500) -> pd.DataFrame:
+    """List Earth Engine assets under a parent.
+
+    Newer earthengine-api versions expect ee.data.listAssets(params_dict),
+    not ee.data.listAssets(parent, params).
+    """
     rows = []
     token = None
     while len(rows) < limit:
-        params = {"pageSize": min(100, limit - len(rows))}
+        params = {
+            "parent": parent,
+            "pageSize": min(100, limit - len(rows)),
+        }
         if token:
             params["pageToken"] = token
-        resp = ee.data.listAssets(parent, params)
+        resp = ee.data.listAssets(params)
         for asset in resp.get("assets", []):
             rows.append({
                 "name": asset.get("name"),
@@ -94,6 +102,7 @@ if refresh:
     st.cache_data.clear()
 
 left, right = st.columns([1.35, 1])
+selected_asset = None
 
 with left:
     st.subheader("Project assets")
@@ -132,7 +141,7 @@ with right:
                 if st.button("Summarize collection"):
                     st.json(image_collection_summary(asset_to_inspect, start, end))
             elif asset_type == "TABLE":
-                st.markdown("**Table preview**")
+                st.markdown("**Table preview")
                 st.dataframe(table_preview(asset_to_inspect), use_container_width=True)
         except Exception as exc:
             st.error("Could not inspect this asset/dataset. Check the ID and permissions.")
