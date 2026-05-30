@@ -17,7 +17,7 @@ import ee
 
 st.info(
     "This page creates a weekly table, not a weekly raster stack. It is designed for monitoring indicators such as SAR flood-like area, rainfall, soil moisture, and image availability. "
-    "Weeks with no imagery are now kept in the table with null values instead of crashing."
+    "Weeks with no imagery are kept in the table with null values instead of crashing."
 )
 
 
@@ -58,7 +58,7 @@ def build_weekly_features(region, cfg):
             def s1_values_when_available():
                 vv = s1.select("VV").median().clip(region)
                 water_like = vv.gte(cfg["vv_min"]).And(vv.lte(cfg["vv_max"])).rename("sar_water_like")
-                area = water_like.selfMask().multiply(ee.Image.pixelArea()).reduceRegion(
+                area = water_like.unmask(0).multiply(ee.Image.pixelArea()).reduceRegion(
                     reducer=ee.Reducer.sum(),
                     geometry=region,
                     scale=cfg["scale"],
@@ -89,20 +89,34 @@ def build_weekly_features(region, cfg):
             })
 
         if cfg["use_chirps"]:
-            rain = (
+            rain_col = (
                 ee.ImageCollection(cfg["chirps_id"])
                 .filterBounds(region)
                 .filterDate(start_s, end_s)
-                .sum()
-                .rename("weekly_rain_mm")
             )
-            rain_mean = rain.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=region,
-                scale=max(cfg["scale"], 5000),
-                maxPixels=1e13,
-            ).get("weekly_rain_mm")
-            props["weekly_rain_mean_mm"] = rain_mean
+            rain_count = rain_col.size()
+
+            def rain_values_when_available():
+                rain = rain_col.sum().rename("weekly_rain_mm").unmask(0)
+                rain_mean = rain.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=region,
+                    scale=max(cfg["scale"], 5000),
+                    maxPixels=1e13,
+                ).get("weekly_rain_mm")
+                return ee.Dictionary({"weekly_rain_mean_mm": rain_mean})
+
+            rain_dict = ee.Dictionary(
+                ee.Algorithms.If(
+                    rain_count.gt(0),
+                    rain_values_when_available(),
+                    ee.Dictionary({"weekly_rain_mean_mm": None}),
+                )
+            )
+            props.update({
+                "chirps_image_count": rain_count,
+                "weekly_rain_mean_mm": rain_dict.get("weekly_rain_mean_mm"),
+            })
 
         if cfg["use_smap"]:
             smap = (
@@ -302,6 +316,7 @@ st.markdown(
 - `s1_image_count`: how many Sentinel-1 images were available in that weekly window.
 - `sar_water_like_area_km2`: area of pixels matching the VV water-like threshold. This is not fully validated flood extent by itself.
 - `vv_mean_db`: average Sentinel-1 VV backscatter over the AOI.
+- `chirps_image_count`: number of daily CHIRPS images in the weekly window.
 - `weekly_rain_mean_mm`: mean CHIRPS rainfall total for the week.
 - `soil_moisture_mean`: mean SMAP surface soil moisture for the week.
 - `s2_image_count`: number of Sentinel-2 images under the cloud threshold.
