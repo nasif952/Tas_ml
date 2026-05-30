@@ -30,7 +30,13 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.5rem; }
+    /* Push content below Streamlit's sticky top bar */
+    .block-container { padding-top: 4.5rem !important; }
+
+    /* Ensure the tab bar itself isn't clipped */
+    div[data-testid="stTabs"] { margin-top: 0.5rem; }
+    div[data-baseweb="tab-list"] { gap: 6px; flex-wrap: nowrap; overflow-x: auto; }
+
     .main-title {
         font-size: 2.2rem; font-weight: 800;
         background: linear-gradient(90deg,#1E88E5,#42A5F5);
