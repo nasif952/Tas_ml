@@ -3,7 +3,7 @@ import plotly.express as px
 import streamlit as st
 
 from utils.ee_auth import show_ee_connection_block
-from utils.gee_presets import AOI_PRESETS, DATASET_PRESETS, PAGE_HELP
+from utils.gee_presets import AOI_PRESETS, DATASET_PRESETS
 
 st.set_page_config(page_title="Weekly GEE Time Series", page_icon="📈", layout="wide")
 st.title("📈 Weekly Google Earth Engine Time Series")
@@ -17,7 +17,7 @@ import ee
 
 st.info(
     "This page creates a weekly table, not a weekly raster stack. It is designed for monitoring indicators such as SAR flood-like area, rainfall, soil moisture, and image availability. "
-    "For hundreds of weeks, table export to Google Drive is safer than direct browser download."
+    "Weeks with no imagery are now kept in the table with null values instead of crashing."
 )
 
 
@@ -54,24 +54,38 @@ def build_weekly_features(region, cfg):
                 s1 = s1.filter(ee.Filter.eq("orbitProperties_pass", cfg["orbit"]))
 
             s1_count = s1.size()
-            vv = s1.select("VV").median().clip(region)
-            water_like = vv.gte(cfg["vv_min"]).And(vv.lte(cfg["vv_max"])).rename("sar_water_like")
-            area = water_like.selfMask().multiply(ee.Image.pixelArea()).reduceRegion(
-                reducer=ee.Reducer.sum(),
-                geometry=region,
-                scale=cfg["scale"],
-                maxPixels=1e13,
-            ).get("sar_water_like")
-            vv_mean = vv.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=region,
-                scale=cfg["scale"],
-                maxPixels=1e13,
-            ).get("VV")
+
+            def s1_values_when_available():
+                vv = s1.select("VV").median().clip(region)
+                water_like = vv.gte(cfg["vv_min"]).And(vv.lte(cfg["vv_max"])).rename("sar_water_like")
+                area = water_like.selfMask().multiply(ee.Image.pixelArea()).reduceRegion(
+                    reducer=ee.Reducer.sum(),
+                    geometry=region,
+                    scale=cfg["scale"],
+                    maxPixels=1e13,
+                ).get("sar_water_like")
+                vv_mean = vv.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=region,
+                    scale=cfg["scale"],
+                    maxPixels=1e13,
+                ).get("VV")
+                return ee.Dictionary({
+                    "sar_water_like_area_km2": ee.Number(area).divide(1e6),
+                    "vv_mean_db": vv_mean,
+                })
+
+            s1_dict = ee.Dictionary(
+                ee.Algorithms.If(
+                    s1_count.gt(0),
+                    s1_values_when_available(),
+                    ee.Dictionary({"sar_water_like_area_km2": None, "vv_mean_db": None}),
+                )
+            )
             props.update({
                 "s1_image_count": s1_count,
-                "sar_water_like_area_km2": ee.Number(area).divide(1e6),
-                "vv_mean_db": vv_mean,
+                "sar_water_like_area_km2": s1_dict.get("sar_water_like_area_km2"),
+                "vv_mean_db": s1_dict.get("vv_mean_db"),
             })
 
         if cfg["use_chirps"]:
@@ -98,16 +112,27 @@ def build_weekly_features(region, cfg):
                 .select("sm_surface")
             )
             smap_count = smap.size()
-            smap_mean_img = smap.mean().rename("soil_moisture")
-            smap_mean = smap_mean_img.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=region,
-                scale=max(cfg["scale"], 9000),
-                maxPixels=1e13,
-            ).get("soil_moisture")
+
+            def smap_values_when_available():
+                smap_mean_img = smap.mean().rename("soil_moisture")
+                smap_mean = smap_mean_img.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=region,
+                    scale=max(cfg["scale"], 9000),
+                    maxPixels=1e13,
+                ).get("soil_moisture")
+                return ee.Dictionary({"soil_moisture_mean": smap_mean})
+
+            smap_dict = ee.Dictionary(
+                ee.Algorithms.If(
+                    smap_count.gt(0),
+                    smap_values_when_available(),
+                    ee.Dictionary({"soil_moisture_mean": None}),
+                )
+            )
             props.update({
                 "smap_image_count": smap_count,
-                "soil_moisture_mean": smap_mean,
+                "soil_moisture_mean": smap_dict.get("soil_moisture_mean"),
             })
 
         if cfg["use_s2"]:
@@ -118,18 +143,28 @@ def build_weekly_features(region, cfg):
                 .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cfg["s2_cloud_pct"]))
             )
             s2_count = s2.size()
-            # Use raw scaled SR bands only for weekly NDWI summary. Cloud masking is intentionally simple for speed.
-            s2_median = s2.median().divide(10000).clip(region)
-            ndwi = s2_median.normalizedDifference(["B3", "B8"]).rename("NDWI")
-            ndwi_mean = ndwi.reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=region,
-                scale=max(cfg["scale"], 60),
-                maxPixels=1e13,
-            ).get("NDWI")
+
+            def s2_values_when_available():
+                s2_median = s2.median().divide(10000).clip(region)
+                ndwi = s2_median.normalizedDifference(["B3", "B8"]).rename("NDWI")
+                ndwi_mean = ndwi.reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=region,
+                    scale=max(cfg["scale"], 60),
+                    maxPixels=1e13,
+                ).get("NDWI")
+                return ee.Dictionary({"ndwi_mean": ndwi_mean})
+
+            s2_dict = ee.Dictionary(
+                ee.Algorithms.If(
+                    s2_count.gt(0),
+                    s2_values_when_available(),
+                    ee.Dictionary({"ndwi_mean": None}),
+                )
+            )
             props.update({
                 "s2_image_count": s2_count,
-                "ndwi_mean": ndwi_mean,
+                "ndwi_mean": s2_dict.get("ndwi_mean"),
             })
 
         features.append(ee.Feature(None, props))
