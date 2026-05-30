@@ -7,22 +7,7 @@ def has_ee_secret() -> bool:
 
 @st.cache_resource(show_spinner=False)
 def init_earth_engine():
-    """Initialize Earth Engine from Streamlit secrets.
-
-    Expected secrets format:
-
-    [earthengine]
-    project = "gee-project-493107"
-    type = "service_account"
-    private_key_id = "..."
-    private_key = """-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"""
-    client_email = "..."
-    client_id = "..."
-    auth_uri = "https://accounts.google.com/o/oauth2/auth"
-    token_uri = "https://oauth2.googleapis.com/token"
-    auth_provider_x509_cert_url = "https://www.googleapis.com/oauth2/v1/certs"
-    client_x509_cert_url = "..."
-    """
+    """Initialize Earth Engine from Streamlit secrets."""
     import ee
     from google.oauth2 import service_account
 
@@ -30,6 +15,15 @@ def init_earth_engine():
         raise RuntimeError("No [earthengine] section found in Streamlit Secrets.")
 
     ee_secrets = st.secrets["earthengine"]
+
+    required_keys = [
+        "project", "type", "private_key_id", "private_key", "client_email",
+        "client_id", "auth_uri", "token_uri", "auth_provider_x509_cert_url",
+        "client_x509_cert_url",
+    ]
+    missing = [key for key in required_keys if key not in ee_secrets]
+    if missing:
+        raise RuntimeError(f"Missing Earth Engine secret keys: {', '.join(missing)}")
 
     service_account_info = {
         "type": ee_secrets["type"],
