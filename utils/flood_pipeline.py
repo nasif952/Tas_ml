@@ -134,6 +134,7 @@ def mask_s2_clouds(img):
 def get_s2_existing_water(region, config: FloodConfig, return_info: bool = False):
     import ee
 
+    # Sentinel-2 NDWI: high-detail existing-water mask when cloud-free images exist.
     s2_base = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(region)
@@ -143,18 +144,41 @@ def get_s2_existing_water(region, config: FloodConfig, return_info: bool = False
     )
     s2_info = adaptive_collection(s2_base, config.s2_water_start, config.s2_water_end, config.max_extra_days)
     s2_col = s2_info["collection"]
-
-    # If Sentinel-2 has no valid images even after adaptive extension, keep the
-    # pipeline alive with a no-existing-water fallback. The availability fields
-    # expose this so it is not hidden.
     fallback_s2 = ee.Image.constant([0, 0]).rename(["B3", "B8"]).clip(region).toFloat()
     safe_s2_col = ee.ImageCollection(
         ee.Algorithms.If(s2_info["found"], s2_col, ee.ImageCollection([fallback_s2]))
     )
-
     s2 = safe_s2_col.median().clip(region)
-    ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI").unmask(-9999)
-    existing_water = ndwi.gt(config.ndwi_threshold).rename("Existing_Water")
+    s2_ndwi = s2.normalizedDifference(["B3", "B8"]).rename("S2_NDWI").unmask(-9999)
+    s2_existing_water = s2_ndwi.gt(config.ndwi_threshold).And(ee.Image.constant(s2_info["found"])).rename("S2_Existing_Water")
+
+    # MODIS NDWI: coarser backup/secondary water mask. This is used every time,
+    # not only when Sentinel-2 fails. MODIS MOD09A1 band 4 is green and band 2 is NIR.
+    modis_water_base = (
+        ee.ImageCollection("MODIS/061/MOD09A1")
+        .filterBounds(region)
+        .select(["sur_refl_b04", "sur_refl_b02"])
+    )
+    modis_info = adaptive_collection(modis_water_base, config.s2_water_start, config.s2_water_end, config.max_extra_days)
+    modis_col = modis_info["collection"]
+    fallback_modis = (
+        ee.Image.constant([0, 0])
+        .rename(["sur_refl_b04", "sur_refl_b02"])
+        .clip(region)
+        .toFloat()
+    )
+    safe_modis_col = ee.ImageCollection(
+        ee.Algorithms.If(modis_info["found"], modis_col, ee.ImageCollection([fallback_modis]))
+    )
+    modis = safe_modis_col.median().clip(region).multiply(0.0001)
+    modis_ndwi = modis.normalizedDifference(["sur_refl_b04", "sur_refl_b02"]).rename("MODIS_NDWI").unmask(-9999)
+    modis_existing_water = modis_ndwi.gt(config.ndwi_threshold).And(ee.Image.constant(modis_info["found"])).rename("MODIS_Existing_Water")
+
+    # Combined mask: flood candidates are removed if either S2 or MODIS says the
+    # pixel is existing/permanent water. MODIS protects the pipeline when S2 is
+    # unavailable, but S2 still adds finer detail when present.
+    existing_water = s2_existing_water.Or(modis_existing_water).rename("Existing_Water")
+    combined_ndwi = ee.ImageCollection([s2_ndwi.rename("NDWI"), modis_ndwi.rename("NDWI")]).max().rename("NDWI")
 
     if return_info:
         info_dict = ee.Dictionary({
@@ -162,10 +186,15 @@ def get_s2_existing_water(region, config: FloodConfig, return_info: bool = False
             "s2_water_mask_extra_days_used": s2_info["extra_days"],
             "s2_water_mask_actual_end": s2_info["actual_end"],
             "s2_water_mask_found": s2_info["found"],
+            "modis_ndwi_water_mask_count": modis_info["count"],
+            "modis_ndwi_water_mask_extra_days_used": modis_info["extra_days"],
+            "modis_ndwi_water_mask_actual_end": modis_info["actual_end"],
+            "modis_ndwi_water_mask_found": modis_info["found"],
+            "combined_existing_water_mask_found": s2_info["found"].Or(modis_info["found"]),
         })
-        return ndwi, existing_water, info_dict
+        return combined_ndwi, existing_water, info_dict
 
-    return ndwi, existing_water
+    return combined_ndwi, existing_water
 
 
 def build_flood_map(stage1_vv, existing_water, config: FloodConfig):
