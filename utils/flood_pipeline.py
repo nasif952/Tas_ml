@@ -38,11 +38,56 @@ class FloodConfig:
     rf_trees: int = 300
     susceptibility_weight: float = 0.70
     high_overlay_threshold: float = 0.66
+    max_extra_days: int = 3
 
 
 def study_area(config: FloodConfig):
     import ee
     return ee.Geometry.Rectangle([config.xmin, config.ymin, config.xmax, config.ymax])
+
+
+def adaptive_collection(base_collection, base_start: str, base_end: str, max_extra_days: int = 3):
+    """Try the requested date window, then extend the end date if empty.
+
+    A nominal 7-day window with max_extra_days=3 becomes 7 -> 8 -> 9 -> 10
+    days. The selected collection plus transparent metadata are returned.
+    """
+    import ee
+
+    max_extra_days = max(0, int(max_extra_days))
+    extensions = ee.List.sequence(0, max_extra_days)
+
+    def candidate(extra):
+        extra = ee.Number(extra)
+        actual_end = ee.Date(base_end).advance(extra, "day")
+        count = base_collection.filterDate(base_start, actual_end).size()
+        return ee.Feature(None, {
+            "extra_days": extra,
+            "count": count,
+            "actual_end": actual_end.format("YYYY-MM-dd"),
+        })
+
+    candidates = ee.FeatureCollection(extensions.map(candidate))
+    valid = candidates.filter(ee.Filter.gt("count", 0)).sort("extra_days")
+    found = valid.size().gt(0)
+    best = ee.Feature(
+        ee.Algorithms.If(
+            found,
+            valid.first(),
+            candidates.sort("extra_days", False).first(),
+        )
+    )
+    extra_days = ee.Number(best.get("extra_days"))
+    actual_end_date = ee.Date(base_end).advance(extra_days, "day")
+    collection = base_collection.filterDate(base_start, actual_end_date)
+
+    return {
+        "collection": collection,
+        "count": collection.size(),
+        "extra_days": extra_days,
+        "actual_end": actual_end_date.format("YYYY-MM-dd"),
+        "found": found,
+    }
 
 
 def get_s1_vv(region, start: str, end: str, orbit: Optional[str] = None):
@@ -60,6 +105,23 @@ def get_s1_vv(region, start: str, end: str, orbit: Optional[str] = None):
     return col.median().clip(region).rename("VV"), col
 
 
+def get_s1_vv_adaptive(region, start: str, end: str, orbit: Optional[str] = None, max_extra_days: int = 3):
+    import ee
+    base_col = (
+        ee.ImageCollection("COPERNICUS/S1_GRD")
+        .filterBounds(region)
+        .filter(ee.Filter.eq("instrumentMode", "IW"))
+        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+        .select("VV")
+    )
+    if orbit and orbit.lower() != "either":
+        base_col = base_col.filter(ee.Filter.eq("orbitProperties_pass", orbit.upper()))
+
+    info = adaptive_collection(base_col, start, end, max_extra_days)
+    col = info["collection"]
+    return col.median().clip(region).rename("VV"), col, info
+
+
 def mask_s2_clouds(img):
     import ee
     qa = img.select("QA60")
@@ -69,29 +131,40 @@ def mask_s2_clouds(img):
     return img.updateMask(mask).divide(10000)
 
 
-def get_s2_existing_water(region, config: FloodConfig):
+def get_s2_existing_water(region, config: FloodConfig, return_info: bool = False):
     import ee
 
-    s2_col = (
+    s2_base = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(region)
-        .filterDate(config.s2_water_start, config.s2_water_end)
         .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", config.s2_cloud_pct))
         .map(mask_s2_clouds)
         .select(["B3", "B8"])
     )
+    s2_info = adaptive_collection(s2_base, config.s2_water_start, config.s2_water_end, config.max_extra_days)
+    s2_col = s2_info["collection"]
 
-    # If Sentinel-2 has no valid images for the chosen cloud/date window, keep
-    # the pipeline alive with a no-existing-water fallback. This is safer than
-    # crashing during NDWI creation.
+    # If Sentinel-2 has no valid images even after adaptive extension, keep the
+    # pipeline alive with a no-existing-water fallback. The availability fields
+    # expose this so it is not hidden.
     fallback_s2 = ee.Image.constant([0, 0]).rename(["B3", "B8"]).clip(region).toFloat()
     safe_s2_col = ee.ImageCollection(
-        ee.Algorithms.If(s2_col.size().gt(0), s2_col, ee.ImageCollection([fallback_s2]))
+        ee.Algorithms.If(s2_info["found"], s2_col, ee.ImageCollection([fallback_s2]))
     )
 
     s2 = safe_s2_col.median().clip(region)
     ndwi = s2.normalizedDifference(["B3", "B8"]).rename("NDWI").unmask(-9999)
     existing_water = ndwi.gt(config.ndwi_threshold).rename("Existing_Water")
+
+    if return_info:
+        info_dict = ee.Dictionary({
+            "s2_water_mask_count": s2_info["count"],
+            "s2_water_mask_extra_days_used": s2_info["extra_days"],
+            "s2_water_mask_actual_end": s2_info["actual_end"],
+            "s2_water_mask_found": s2_info["found"],
+        })
+        return ndwi, existing_water, info_dict
+
     return ndwi, existing_water
 
 
@@ -144,13 +217,19 @@ def build_predictors(region, config: FloodConfig):
     extra_layers: Dict[str, object] = {}
     availability = {}
 
-    modis_raw = (
+    modis_base = (
         ee.ImageCollection("MODIS/061/MOD09A1")
         .filterBounds(region)
-        .filterDate(config.predictor_start, config.predictor_end)
         .select(["sur_refl_b01", "sur_refl_b02", "sur_refl_b06"])
     )
-    availability["modis_surface_reflectance_count"] = modis_raw.size()
+    modis_info = adaptive_collection(modis_base, config.predictor_start, config.predictor_end, config.max_extra_days)
+    modis_raw = modis_info["collection"]
+    availability.update({
+        "modis_surface_reflectance_count": modis_info["count"],
+        "modis_surface_reflectance_extra_days_used": modis_info["extra_days"],
+        "modis_surface_reflectance_actual_end": modis_info["actual_end"],
+        "modis_surface_reflectance_found": modis_info["found"],
+    })
     modis_fallback = (
         ee.Image.constant([0, 0, 0])
         .rename(["sur_refl_b01", "sur_refl_b02", "sur_refl_b06"])
@@ -159,7 +238,7 @@ def build_predictors(region, config: FloodConfig):
     )
     modis = (
         ee.ImageCollection(
-            ee.Algorithms.If(modis_raw.size().gt(0), modis_raw, ee.ImageCollection([modis_fallback]))
+            ee.Algorithms.If(modis_info["found"], modis_raw, ee.ImageCollection([modis_fallback]))
         )
         .median()
         .clip(region)
@@ -168,13 +247,19 @@ def build_predictors(region, config: FloodConfig):
     ndvi = modis.normalizedDifference(["sur_refl_b02", "sur_refl_b01"]).rename("NDVI").unmask(-9999)
     ndbi = modis.normalizedDifference(["sur_refl_b06", "sur_refl_b02"]).rename("NDBI").unmask(-9999)
 
-    precipitation_raw = (
+    precipitation_base = (
         ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
         .filterBounds(region)
-        .filterDate(config.month_start, config.month_end)
         .select("precipitation")
     )
-    availability["monthly_chirps_count"] = precipitation_raw.size()
+    precipitation_info = adaptive_collection(precipitation_base, config.month_start, config.month_end, config.max_extra_days)
+    precipitation_raw = precipitation_info["collection"]
+    availability.update({
+        "monthly_chirps_count": precipitation_info["count"],
+        "monthly_chirps_extra_days_used": precipitation_info["extra_days"],
+        "monthly_chirps_actual_end": precipitation_info["actual_end"],
+        "monthly_chirps_found": precipitation_info["found"],
+    })
     precipitation = (
         _safe_single_band_collection(
             precipitation_raw,
@@ -186,13 +271,19 @@ def build_predictors(region, config: FloodConfig):
         .toFloat()
     )
 
-    event_rainfall_raw = (
+    event_rainfall_base = (
         ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
         .filterBounds(region)
-        .filterDate(config.event_rain_start, config.event_rain_end)
         .select("precipitation")
     )
-    availability["event_chirps_count"] = event_rainfall_raw.size()
+    event_rainfall_info = adaptive_collection(event_rainfall_base, config.event_rain_start, config.event_rain_end, config.max_extra_days)
+    event_rainfall_raw = event_rainfall_info["collection"]
+    availability.update({
+        "event_chirps_count": event_rainfall_info["count"],
+        "event_chirps_extra_days_used": event_rainfall_info["extra_days"],
+        "event_chirps_actual_end": event_rainfall_info["actual_end"],
+        "event_chirps_found": event_rainfall_info["found"],
+    })
     event_rainfall = (
         _safe_single_band_collection(
             event_rainfall_raw,
@@ -204,13 +295,19 @@ def build_predictors(region, config: FloodConfig):
         .toFloat()
     )
 
-    temperature_raw = (
+    temperature_base = (
         ee.ImageCollection("MODIS/061/MOD11A2")
         .filterBounds(region)
-        .filterDate(config.month_start, config.month_end)
         .select("LST_Day_1km")
     )
-    availability["modis_lst_count"] = temperature_raw.size()
+    temperature_info = adaptive_collection(temperature_base, config.month_start, config.month_end, config.max_extra_days)
+    temperature_raw = temperature_info["collection"]
+    availability.update({
+        "modis_lst_count": temperature_info["count"],
+        "modis_lst_extra_days_used": temperature_info["extra_days"],
+        "modis_lst_actual_end": temperature_info["actual_end"],
+        "modis_lst_found": temperature_info["found"],
+    })
     temperature = (
         _safe_single_band_collection(
             temperature_raw,
@@ -261,13 +358,19 @@ def build_predictors(region, config: FloodConfig):
         extra_layers["river_buffer"] = river_buffer
 
     if config.use_soil_moisture:
-        smap_raw = (
+        smap_base = (
             ee.ImageCollection("NASA/SMAP/SPL4SMGP/007")
             .filterBounds(region)
-            .filterDate(config.soil_start, config.soil_end)
             .select("sm_surface")
         )
-        availability["smap_soil_moisture_count"] = smap_raw.size()
+        smap_info = adaptive_collection(smap_base, config.soil_start, config.soil_end, config.max_extra_days)
+        smap_raw = smap_info["collection"]
+        availability.update({
+            "smap_soil_moisture_count": smap_info["count"],
+            "smap_soil_moisture_extra_days_used": smap_info["extra_days"],
+            "smap_soil_moisture_actual_end": smap_info["actual_end"],
+            "smap_soil_moisture_found": smap_info["found"],
+        })
         soil_moisture = (
             _safe_single_band_collection(
                 smap_raw,
