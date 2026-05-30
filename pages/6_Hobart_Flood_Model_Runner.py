@@ -188,6 +188,7 @@ with c2:
 
 # Map
 st.subheader("Interactive Earth Engine output map")
+st.caption("Map interactions are disabled from triggering Streamlit reruns so the model output does not disappear after tiles load.")
 with st.spinner("Rendering map tiles..."):
     m = hobart_map(zoom_start=10)
     folium.Rectangle(bounds=[[ymin, xmin], [ymax, xmax]], color="black", weight=2, fill=False, tooltip="AOI").add_to(m)
@@ -209,7 +210,13 @@ with st.spinner("Rendering map tiles..."):
     except Exception:
         pass
     folium.LayerControl().add_to(m)
-    st_folium(m, height=720, use_container_width=True)
+    st_folium(
+        m,
+        height=720,
+        use_container_width=True,
+        returned_objects=[],
+        key="hobart_flood_output_map_static",
+    )
 
 # Downloads and exports
 st.subheader("Export current run")
