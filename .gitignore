@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Streamlit / local secrets
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
