@@ -321,7 +321,7 @@ var samples = stack.stratifiedSample({
   numPoints: 0,
   classBand: 'label',
   classValues: [0, 1],
-  classPoints: [600, 600],
+  classPoints: [2000, 2000],
   region: studyArea,
   scale: scale,
   seed: 42,
