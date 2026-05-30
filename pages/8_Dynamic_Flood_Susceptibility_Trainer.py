@@ -18,7 +18,10 @@ from utils.flood_pipeline import (
     build_final_overlay,
     area_km2,
 )
-from utils.gee_presets import AOI_PRESETS, DATASET_PRESETS, VV_THRESHOLD_PRESETS, NDWI_PRESETS, MODEL_PRESETS
+from utils.gee_presets import DATASET_PRESETS, VV_THRESHOLD_PRESETS, NDWI_PRESETS, MODEL_PRESETS
+
+# Study area is defined by an uploaded polygon asset instead of a bounding box.
+DEFAULT_AOI_ASSET = "projects/sturdy-apricot-405823/assets/Study_Area"
 
 st.set_page_config(page_title="Dynamic Flood Susceptibility Trainer", page_icon="🔁", layout="wide")
 st.title("🔁 Dynamic Flood Susceptibility Trainer")
@@ -246,14 +249,15 @@ with st.sidebar:
 
     st.divider()
     st.header("2. AOI")
-    aoi_options = list(AOI_PRESETS.keys())
-    aoi_name = st.selectbox("AOI preset", aoi_options, index=preset_index(aoi_options, ev["aoi_name"]), key=f"{event_key}_aoi")
-    bbox = AOI_PRESETS[aoi_name]["bbox"]
-    st.caption(AOI_PRESETS[aoi_name]["description"])
-    xmin = st.number_input("Min longitude", value=float(bbox[0]), step=0.01, format="%.4f", key=f"{event_key}_xmin")
-    ymin = st.number_input("Min latitude", value=float(bbox[1]), step=0.01, format="%.4f", key=f"{event_key}_ymin")
-    xmax = st.number_input("Max longitude", value=float(bbox[2]), step=0.01, format="%.4f", key=f"{event_key}_xmax")
-    ymax = st.number_input("Max latitude", value=float(bbox[3]), step=0.01, format="%.4f", key=f"{event_key}_ymax")
+    aoi_asset = st.text_input(
+        "Study area polygon asset",
+        ev.get("aoi_asset", DEFAULT_AOI_ASSET),
+        key=f"{event_key}_aoi_asset",
+    )
+    st.caption(
+        "The analysis region is the uploaded Study_Area polygon asset. "
+        "Bounding-box rectangles are no longer used on this page."
+    )
 
     st.divider()
     st.header("3. Existing-water mask")
@@ -314,7 +318,7 @@ with st.sidebar:
     building_asset = st.text_input("Building asset", default_building_asset, key=f"{event_key}_building_asset")
 
 config = FloodConfig(
-    xmin=xmin, ymin=ymin, xmax=xmax, ymax=ymax, scale=scale, seed=int(seed),
+    aoi_asset=aoi_asset, scale=scale, seed=int(seed),
     s1_stage1_start=label_start, s1_stage1_end=label_end,
     s1_stage2_start=recovery_start, s1_stage2_end=recovery_end,
     s2_water_start=water_start, s2_water_end=water_end,
@@ -428,7 +432,7 @@ if run:
                 "high_overlay": high_overlay,
                 "extra_layers": extra_layers,
                 "importance_fc": model_outputs["importance_fc"],
-                "bbox": [xmin, ymin, xmax, ymax],
+                "aoi_asset": aoi_asset,
                 "scale": scale,
                 "building_asset": building_asset,
                 "event_name": event_name,
@@ -482,10 +486,10 @@ with c2:
 
 st.subheader("Updated SAR-change susceptibility map")
 region = outputs["region"]
-xmin, ymin, xmax, ymax = outputs["bbox"]
 with st.spinner("Rendering updated Earth Engine layers..."):
     m = hobart_map(zoom_start=10)
-    folium.Rectangle(bounds=[[ymin, xmin], [ymax, xmax]], color="black", weight=2, fill=False, tooltip="AOI").add_to(m)
+    aoi_outline = ee.Image().byte().paint(ee.FeatureCollection(outputs["aoi_asset"]), 1, 2)
+    add_ee_layer(m, aoi_outline, {"palette": ["black"]}, "Study area boundary", shown=True)
     add_ee_layer(m, outputs["flood_map"].selfMask(), get_default_vis("flood_map"), "SAR-change flood label", shown=True)
     add_ee_layer(m, outputs["susceptibility"], get_default_vis("susceptibility"), "Updated RF susceptibility", shown=True, opacity=0.75)
     add_ee_layer(m, outputs["final_overlay"], get_default_vis("final_overlay"), "Updated final overlay", shown=False, opacity=0.75)

@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 
 @dataclass
 class FloodConfig:
+    aoi_asset: str = ""
     xmin: float = 146.85
     ymin: float = -43.10
     xmax: float = 147.55
@@ -44,6 +45,8 @@ class FloodConfig:
 
 def study_area(config: FloodConfig):
     import ee
+    if getattr(config, "aoi_asset", ""):
+        return ee.FeatureCollection(config.aoi_asset).geometry()
     return ee.Geometry.Rectangle([config.xmin, config.ymin, config.xmax, config.ymax])
 
 
