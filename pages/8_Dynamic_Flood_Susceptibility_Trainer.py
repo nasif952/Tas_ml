@@ -9,7 +9,7 @@ from utils.ee_visualization import add_ee_layer, hobart_map, get_default_vis
 from utils.flood_pipeline import (
     FloodConfig,
     study_area,
-    get_s1_vv,
+    get_s1_vv_adaptive,
     get_s2_existing_water,
     build_flood_map,
     build_persistence,
@@ -24,7 +24,7 @@ st.set_page_config(page_title="Dynamic Flood Susceptibility Trainer", page_icon=
 st.title("🔁 Dynamic Flood Susceptibility Trainer")
 st.caption(
     "Train and update a flood susceptibility map for any selected event/week, not only the 2018 Hobart event. "
-    "Use weekly monitoring results to choose target windows, then train a new SAR/NDWI-derived model."
+    "The trainer now uses adaptive date windows: nominal window first, then +1, +2, +3 days if no data exists."
 )
 
 show_ee_connection_block()
@@ -73,6 +73,7 @@ EVENT_LIBRARY = {
         "seed": 42,
         "susceptibility_weight": 0.70,
         "high_overlay_threshold": 0.66,
+        "max_extra_days": 3,
         "building_asset": "",
         "note": "Your requested February 2026 Greater Hobart setup. Recovery window is before the target window, so persistence is treated as a comparison layer, not post-event recovery.",
     },
@@ -112,6 +113,7 @@ EVENT_LIBRARY = {
         "seed": 42,
         "susceptibility_weight": 0.70,
         "high_overlay_threshold": 0.66,
+        "max_extra_days": 3,
         "building_asset": DATASET_PRESETS["Greater Hobart Buildings asset"]["id"],
         "note": "Original Hobart prototype event.",
     },
@@ -151,6 +153,7 @@ EVENT_LIBRARY = {
         "seed": 42,
         "susceptibility_weight": 0.70,
         "high_overlay_threshold": 0.66,
+        "max_extra_days": 3,
         "building_asset": DATASET_PRESETS["Greater Hobart Buildings asset"]["id"],
         "note": "Template for training a new weekly/event model. Edit all dates below.",
     },
@@ -190,6 +193,7 @@ EVENT_LIBRARY = {
         "seed": 42,
         "susceptibility_weight": 0.70,
         "high_overlay_threshold": 0.66,
+        "max_extra_days": 3,
         "building_asset": DATASET_PRESETS["Greater Hobart Buildings asset"]["id"],
         "note": "Fully custom event setup.",
     },
@@ -209,6 +213,10 @@ def metric_value(value, decimals=3):
         return "n/a"
 
 
+def ee_bool_to_text(value):
+    return "yes" if bool(value) else "no"
+
+
 with st.sidebar:
     st.header("1. What are you training?")
     event_options = list(EVENT_LIBRARY.keys())
@@ -225,6 +233,13 @@ with st.sidebar:
     label_end = st.text_input("Target label SAR end", ev["label_end"], key=f"{event_key}_label_end")
     recovery_start = st.text_input("Recovery SAR start", ev["recovery_start"], key=f"{event_key}_recovery_start")
     recovery_end = st.text_input("Recovery SAR end", ev["recovery_end"], key=f"{event_key}_recovery_end")
+    max_extra_days = st.select_slider(
+        "Auto-extend if no data",
+        options=[0, 1, 2, 3],
+        value=int(ev.get("max_extra_days", 3)),
+        key=f"{event_key}_max_extra_days",
+    )
+    st.caption("0 = exact date range only. 3 = try nominal range, then +1, +2, +3 days. For a 7-day window this becomes 7→8→9→10 days.")
 
     if recovery_start < label_start:
         st.warning("This preset uses a comparison/reference SAR window before the target label window. That is valid for comparison, but it is not a post-event recovery window.")
@@ -262,7 +277,7 @@ with st.sidebar:
 
     st.divider()
     st.header("5. Predictors and dates")
-    st.caption("These predictors are rebuilt for the selected event/update period.")
+    st.caption("These predictors are rebuilt for the selected event/update period. Each collection also uses the adaptive +0 to +3 day extension if needed.")
     predictor_start = st.text_input("MODIS predictor start", ev["predictor_start"], key=f"{event_key}_predictor_start")
     predictor_end = st.text_input("MODIS predictor end", ev["predictor_end"], key=f"{event_key}_predictor_end")
     month_start = st.text_input("Monthly rainfall/temp start", ev["month_start"], key=f"{event_key}_month_start")
@@ -312,6 +327,7 @@ config = FloodConfig(
     class_points=class_points, train_fraction=train_fraction,
     rf_trees=rf_trees, susceptibility_weight=susceptibility_weight,
     high_overlay_threshold=high_overlay_threshold,
+    max_extra_days=int(max_extra_days),
 )
 
 run = st.button("Train / update susceptibility map", type="primary", use_container_width=True)
@@ -320,36 +336,56 @@ if run:
     with st.status("Training dynamic susceptibility model...", expanded=True) as status:
         try:
             region = study_area(config)
-            status.write("Checking Sentinel-1 availability...")
-            stage1_vv, stage1_col = get_s1_vv(region, label_start, label_end, orbit)
-            stage2_vv, stage2_col = get_s1_vv(region, recovery_start, recovery_end, orbit)
+            adaptive_summary = {}
+
+            status.write("Checking Sentinel-1 availability with adaptive date extension...")
+            stage1_vv, stage1_col, stage1_info = get_s1_vv_adaptive(region, label_start, label_end, orbit, config.max_extra_days)
+            stage2_vv, stage2_col, stage2_info = get_s1_vv_adaptive(region, recovery_start, recovery_end, orbit, config.max_extra_days)
             stage1_count = stage1_col.size().getInfo()
             stage2_count = stage2_col.size().getInfo()
+            stage1_meta = ee.Dictionary({
+                "target_s1_count": stage1_info["count"],
+                "target_s1_extra_days_used": stage1_info["extra_days"],
+                "target_s1_actual_end": stage1_info["actual_end"],
+                "target_s1_found": stage1_info["found"],
+            }).getInfo()
+            stage2_meta = ee.Dictionary({
+                "recovery_s1_count": stage2_info["count"],
+                "recovery_s1_extra_days_used": stage2_info["extra_days"],
+                "recovery_s1_actual_end": stage2_info["actual_end"],
+                "recovery_s1_found": stage2_info["found"],
+            }).getInfo()
+            adaptive_summary.update(stage1_meta)
+            adaptive_summary.update(stage2_meta)
+
             if stage1_count == 0:
-                st.error("No Sentinel-1 images found in the target label window. Use a wider date range or choose Either orbit.")
+                st.error("No Sentinel-1 images found in the target label window, even after adaptive extension. Increase the date range, increase max extra days, or choose Either orbit.")
                 st.stop()
 
             if stage2_count == 0:
-                st.warning("No Sentinel-1 images found in the recovery/comparison window. Stuck-water/persistence will be set to zero so training can continue.")
+                st.warning("No Sentinel-1 images found in the recovery/comparison window, even after adaptive extension. Stuck-water/persistence will be set to zero so training can continue.")
                 stage2_vv = stage1_vv
                 vv_change = ee.Image.constant(0).clip(region).rename("Stage2_minus_Stage1").toFloat()
                 stuck_water = ee.Image.constant(0).clip(region).rename("Stuck_Water").toInt()
                 persistence = ee.Image.constant(0).clip(region).rename("Flood_Persistence").toInt()
-                persistence_note = "No recovery/comparison S1 images; persistence was set to zero."
+                persistence_note = "No recovery/comparison S1 images after adaptive extension; persistence was set to zero."
             else:
-                persistence_note = "Persistence layer built from selected recovery/comparison SAR window."
+                persistence_note = "Persistence layer built from selected recovery/comparison SAR window after adaptive availability check."
 
-            status.write("Building pre-event NDWI existing-water mask...")
-            ndwi, existing_water = get_s2_existing_water(region, config)
+            status.write("Building pre-event NDWI existing-water mask with adaptive date extension...")
+            ndwi, existing_water, s2_water_info = get_s2_existing_water(region, config, return_info=True)
+            adaptive_summary.update(s2_water_info.getInfo())
+
             status.write("Building SAR-derived event flood label...")
             flood_map = build_flood_map(stage1_vv, existing_water, config)
             if stage2_count > 0:
                 vv_change, stuck_water, persistence = build_persistence(stage1_vv, stage2_vv, flood_map, config)
 
-            status.write("Building event-specific predictors with missing-data safeguards...")
+            status.write("Building event-specific predictors with adaptive date extension and missing-data safeguards...")
             predictors, predictor_names, extra_layers = build_predictors(region, config)
             availability = extra_layers.get("availability")
             availability_info = availability.getInfo() if availability is not None else {}
+            availability_info.update(adaptive_summary)
 
             status.write("Training Random Forest and generating susceptibility probability raster...")
             model_outputs = train_rf_susceptibility(region, predictors, flood_map, predictor_names, config)
@@ -368,6 +404,7 @@ if run:
                 "predictor_names": predictor_names,
                 "availability": availability_info,
                 "persistence_note": persistence_note,
+                "max_extra_days": int(max_extra_days),
             }
             outputs = {
                 "region": region,
@@ -397,7 +434,7 @@ if run:
             st.stop()
 
 if "dynamic_flood_outputs" not in st.session_state:
-    st.info("Select any historical/recent update window, then train the model. Use the Weekly Time Series page first to identify weeks with high SAR water-like area/rainfall.")
+    st.info("Select any historical/recent update window, then train the model. Use the Hybrid Monitoring page first to identify periods with high SAR water-like area/rainfall.")
     st.stop()
 
 outputs = st.session_state["dynamic_flood_outputs"]
@@ -415,14 +452,14 @@ st.info(metrics.get("persistence_note", ""))
 
 availability = metrics.get("availability", {})
 if availability:
-    with st.expander("Input data availability used by predictor builder", expanded=False):
+    with st.expander("Input data availability and adaptive date extension", expanded=True):
         st.json(availability)
-        missing_items = [k for k, v in availability.items() if v == 0]
-        if missing_items:
-            st.warning(
-                "Some predictor collections had zero images/features and were filled with -9999 fallback values: "
-                + ", ".join(missing_items)
-            )
+        not_found = [k for k, v in availability.items() if k.endswith("_found") and v is False]
+        extra_used = {k: v for k, v in availability.items() if k.endswith("_extra_days_used") and v not in [0, "0"]}
+        if extra_used:
+            st.info("Some datasets needed adaptive date extension. The exact extra days and actual end dates are shown above.")
+        if not_found:
+            st.warning("Some datasets still had no data after adaptive extension and used fallback values: " + ", ".join(not_found))
 
 c1, c2 = st.columns([1, 1])
 with c1:
