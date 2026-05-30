@@ -29,6 +29,7 @@ class FloodConfig:
     vv_max: float = -15.0
     ndwi_threshold: float = 0.0
     stuck_change_tolerance: float = 2.0
+    sar_change_threshold_db: float = -2.0
     river_asset: str = "WWF/HydroSHEDS/v1/FreeFlowingRivers"
     river_distance_cap_m: int = 1000
     use_river_distance: bool = True
@@ -47,11 +48,7 @@ def study_area(config: FloodConfig):
 
 
 def adaptive_collection(base_collection, base_start: str, base_end: str, max_extra_days: int = 3):
-    """Try the requested date window, then extend the end date if empty.
-
-    A nominal 7-day window with max_extra_days=3 becomes 7 -> 8 -> 9 -> 10
-    days. The selected collection plus transparent metadata are returned.
-    """
+    """Try the requested date window, then extend the end date if empty."""
     import ee
 
     max_extra_days = max(0, int(max_extra_days))
@@ -90,36 +87,67 @@ def adaptive_collection(base_collection, base_start: str, base_end: str, max_ext
     }
 
 
-def get_s1_vv(region, start: str, end: str, orbit: Optional[str] = None):
+def _s1_vv_base_collection(region, orbit: Optional[str] = None):
     import ee
     col = (
         ee.ImageCollection("COPERNICUS/S1_GRD")
         .filterBounds(region)
-        .filterDate(start, end)
         .filter(ee.Filter.eq("instrumentMode", "IW"))
         .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
         .select("VV")
     )
     if orbit and orbit.lower() != "either":
         col = col.filter(ee.Filter.eq("orbitProperties_pass", orbit.upper()))
+    return col
+
+
+def get_s1_vv(region, start: str, end: str, orbit: Optional[str] = None):
+    col = _s1_vv_base_collection(region, orbit).filterDate(start, end)
     return col.median().clip(region).rename("VV"), col
 
 
 def get_s1_vv_adaptive(region, start: str, end: str, orbit: Optional[str] = None, max_extra_days: int = 3):
-    import ee
-    base_col = (
-        ee.ImageCollection("COPERNICUS/S1_GRD")
-        .filterBounds(region)
-        .filter(ee.Filter.eq("instrumentMode", "IW"))
-        .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-        .select("VV")
-    )
-    if orbit and orbit.lower() != "either":
-        base_col = base_col.filter(ee.Filter.eq("orbitProperties_pass", orbit.upper()))
-
+    base_col = _s1_vv_base_collection(region, orbit)
     info = adaptive_collection(base_col, start, end, max_extra_days)
     col = info["collection"]
     return col.median().clip(region).rename("VV"), col, info
+
+
+def get_s1_vv_event_change(
+    region,
+    pre_start: str,
+    pre_end: str,
+    target_start: str,
+    target_end: str,
+    orbit: Optional[str] = None,
+    max_extra_days: int = 3,
+):
+    """Build SAR layers for flood change detection.
+
+    Pre-event: closest available Sentinel-1 VV image inside/adapted pre window.
+    During-event: mean Sentinel-1 VV composite inside/adapted target window.
+    Change: during_mean_vv - pre_closest_vv. Flooding usually causes a negative
+    dB drop over land because smooth water has lower SAR backscatter.
+    """
+    import ee
+
+    base_col = _s1_vv_base_collection(region, orbit)
+
+    pre_info = adaptive_collection(base_col, pre_start, pre_end, max_extra_days)
+    pre_col = pre_info["collection"]
+    pre_vv = (
+        ee.Image(pre_col.sort("system:time_start", False).first())
+        .clip(region)
+        .rename("Pre_Closest_VV")
+    )
+
+    target_info = adaptive_collection(base_col, target_start, target_end, max_extra_days)
+    target_col = target_info["collection"]
+    during_vv = target_col.mean().clip(region).rename("During_Mean_VV")
+
+    sar_change = during_vv.subtract(pre_vv).rename("SAR_Change_DuringMinusPre")
+
+    return pre_vv, during_vv, sar_change, pre_col, target_col, pre_info, target_info
 
 
 def mask_s2_clouds(img):
@@ -134,7 +162,6 @@ def mask_s2_clouds(img):
 def get_s2_existing_water(region, config: FloodConfig, return_info: bool = False):
     import ee
 
-    # Sentinel-2 NDWI: high-detail existing-water mask when cloud-free images exist.
     s2_base = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(region)
@@ -150,10 +177,9 @@ def get_s2_existing_water(region, config: FloodConfig, return_info: bool = False
     )
     s2 = safe_s2_col.median().clip(region)
     s2_ndwi = s2.normalizedDifference(["B3", "B8"]).rename("S2_NDWI").unmask(-9999)
-    s2_existing_water = s2_ndwi.gt(config.ndwi_threshold).And(ee.Image.constant(s2_info["found"])).rename("S2_Existing_Water")
+    s2_valid = ee.Image.constant(ee.Algorithms.If(s2_info["found"], 1, 0)).toByte()
+    s2_existing_water = s2_ndwi.gt(config.ndwi_threshold).And(s2_valid).rename("S2_Existing_Water")
 
-    # MODIS NDWI: coarser backup/secondary water mask. This is used every time,
-    # not only when Sentinel-2 fails. MODIS MOD09A1 band 4 is green and band 2 is NIR.
     modis_water_base = (
         ee.ImageCollection("MODIS/061/MOD09A1")
         .filterBounds(region)
@@ -172,11 +198,9 @@ def get_s2_existing_water(region, config: FloodConfig, return_info: bool = False
     )
     modis = safe_modis_col.median().clip(region).multiply(0.0001)
     modis_ndwi = modis.normalizedDifference(["sur_refl_b04", "sur_refl_b02"]).rename("MODIS_NDWI").unmask(-9999)
-    modis_existing_water = modis_ndwi.gt(config.ndwi_threshold).And(ee.Image.constant(modis_info["found"])).rename("MODIS_Existing_Water")
+    modis_valid = ee.Image.constant(ee.Algorithms.If(modis_info["found"], 1, 0)).toByte()
+    modis_existing_water = modis_ndwi.gt(config.ndwi_threshold).And(modis_valid).rename("MODIS_Existing_Water")
 
-    # Combined mask: flood candidates are removed if either S2 or MODIS says the
-    # pixel is existing/permanent water. MODIS protects the pipeline when S2 is
-    # unavailable, but S2 still adds finer detail when present.
     existing_water = s2_existing_water.Or(modis_existing_water).rename("Existing_Water")
     combined_ndwi = ee.ImageCollection([s2_ndwi.rename("NDWI"), modis_ndwi.rename("NDWI")]).max().rename("NDWI")
 
@@ -190,7 +214,7 @@ def get_s2_existing_water(region, config: FloodConfig, return_info: bool = False
             "modis_ndwi_water_mask_extra_days_used": modis_info["extra_days"],
             "modis_ndwi_water_mask_actual_end": modis_info["actual_end"],
             "modis_ndwi_water_mask_found": modis_info["found"],
-            "combined_existing_water_mask_found": s2_info["found"].Or(modis_info["found"]),
+            "combined_existing_water_mask_found": ee.Algorithms.If(s2_info["found"], True, modis_info["found"]),
         })
         return combined_ndwi, existing_water, info_dict
 
@@ -201,6 +225,17 @@ def build_flood_map(stage1_vv, existing_water, config: FloodConfig):
     return (
         stage1_vv.lte(config.vv_max)
         .And(stage1_vv.gte(config.vv_min))
+        .And(existing_water.Not())
+        .rename("Flood_Map")
+    )
+
+
+def build_change_flood_map(during_vv, sar_change, existing_water, config: FloodConfig):
+    """Flood label from during-event water-like SAR and pre-to-during dB drop."""
+    return (
+        during_vv.lte(config.vv_max)
+        .And(during_vv.gte(config.vv_min))
+        .And(sar_change.lte(config.sar_change_threshold_db))
         .And(existing_water.Not())
         .rename("Flood_Map")
     )
@@ -422,9 +457,6 @@ def build_predictors(region, config: FloodConfig):
 def train_rf_susceptibility(region, predictors, label, predictor_names: List[str], config: FloodConfig):
     import ee
 
-    # Always select and unmask predictors before sampling. This prevents
-    # missing-property crashes such as:
-    # "Property 'soil_moisture' of feature '0' is missing."
     clean_predictors = predictors.select(predictor_names).unmask(-9999).toFloat()
     stack = clean_predictors.addBands(label.unmask(0).toInt().rename("label"))
 
