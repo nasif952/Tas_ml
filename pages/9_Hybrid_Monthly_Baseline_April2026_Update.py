@@ -5,11 +5,12 @@ import streamlit as st
 from utils.ee_auth import show_ee_connection_block
 from utils.gee_presets import AOI_PRESETS, DATASET_PRESETS
 
-st.set_page_config(page_title="Hybrid Baseline + April 2026 Update", page_icon="🧭", layout="wide")
-st.title("🧭 Hybrid Monitoring: Historical Monthly Baseline + April 2026 Weekly Update")
+st.set_page_config(page_title="Hybrid Baseline + Recent Weekly Update", page_icon="🧭", layout="wide")
+st.title("🧭 Hybrid Monitoring: Historical Monthly Baseline + Recent Weekly Update")
 st.caption(
-    "Build a compact monitoring table for susceptibility updating: monthly historical baseline before April 2026, "
-    "then 7-day update windows for April 2026. Empty data windows can automatically extend until imagery/data is found."
+    "Build a compact monitoring table for susceptibility updating: monthly historical baseline first, "
+    "then 7-day update windows for the previous month + current month. If no dataset is found in 7 days, "
+    "the app tries 8, 9, and 10 days."
 )
 
 show_ee_connection_block()
@@ -17,8 +18,9 @@ show_ee_connection_block()
 import ee
 
 st.info(
-    "Recommended workflow: use this page to create historical monthly context and April 2026 weekly update indicators, "
-    "then use the Dynamic Flood Susceptibility Trainer with the chosen April week as the target SAR label window."
+    "Corrected design: historical data is monthly, but the recent/current monitoring period uses 7-day windows. "
+    "For the current project timing, the recent update period starts from April 2026 and continues through May 2026. "
+    "Use the April/May weekly rows to choose a target window in the Dynamic Flood Susceptibility Trainer."
 )
 
 
@@ -29,7 +31,7 @@ def monthly_periods(start_date: str, end_date: str):
         end = start + pd.offsets.MonthBegin(1)
         rows.append({
             "period_index": i,
-            "period_type": "historical_monthly",
+            "period_type": "historical_monthly_baseline",
             "start_date": start.strftime("%Y-%m-%d"),
             "end_date": end.strftime("%Y-%m-%d"),
             "nominal_days": int((end - start).days),
@@ -37,14 +39,14 @@ def monthly_periods(start_date: str, end_date: str):
     return rows
 
 
-def weekly_periods(start_date: str, end_date: str, step_days: int):
+def weekly_periods(start_date: str, end_date: str, step_days: int = 7):
     starts = pd.date_range(pd.to_datetime(start_date), pd.to_datetime(end_date), freq=f"{step_days}D")
     rows = []
     for i, start in enumerate(starts):
         end = min(start + pd.Timedelta(days=step_days), pd.to_datetime(end_date) + pd.Timedelta(days=1))
         rows.append({
             "period_index": i,
-            "period_type": "april_2026_weekly_update",
+            "period_type": "recent_7day_update",
             "start_date": start.strftime("%Y-%m-%d"),
             "end_date": end.strftime("%Y-%m-%d"),
             "nominal_days": int((end - start).days),
@@ -52,9 +54,9 @@ def weekly_periods(start_date: str, end_date: str, step_days: int):
     return rows
 
 
-def build_period_table(hist_start, hist_end, update_start, update_end, weekly_step):
+def build_period_table(hist_start, hist_end, update_start, update_end):
     hist = monthly_periods(hist_start, hist_end)
-    updates = weekly_periods(update_start, update_end, weekly_step)
+    updates = weekly_periods(update_start, update_end, 7)
     all_rows = hist + updates
     for i, row in enumerate(all_rows):
         row["global_index"] = i
@@ -62,11 +64,12 @@ def build_period_table(hist_start, hist_end, update_start, update_end, weekly_st
 
 
 def adaptive_collection(base_collection, base_start: str, base_end: str, max_extra_days: int):
-    """Return a dict with an adaptively expanded collection.
+    """Return a collection that expands from 7 days up to 10 days if needed.
 
-    If the base window has no images, the end date is expanded one day at a time
-    up to max_extra_days. The first extension with data is selected. If no data
-    is found, the collection stays empty and the metric returns null.
+    The original window is used first. If no image/data exists, the end date is
+    expanded by 1, 2, then 3 days. For a 7-day recent window, that means 8, 9,
+    and 10 days. Historical monthly windows also use the same safety check, but
+    they usually already contain data.
     """
     extensions = ee.List.sequence(0, max_extra_days)
 
@@ -106,7 +109,6 @@ def build_hybrid_features(region, cfg):
         cfg["hist_end"],
         cfg["update_start"],
         cfg["update_end"],
-        cfg["weekly_step"],
     )
 
     features = []
@@ -143,7 +145,13 @@ def build_hybrid_features(region, cfg):
                     "vv_mean_db": vv_mean,
                 })
 
-            s1_dict = ee.Dictionary(ee.Algorithms.If(s1_info["found"], s1_metrics(), null_dict(["sar_water_like_area_km2", "vv_mean_db"])))
+            s1_dict = ee.Dictionary(
+                ee.Algorithms.If(
+                    s1_info["found"],
+                    s1_metrics(),
+                    null_dict(["sar_water_like_area_km2", "vv_mean_db"]),
+                )
+            )
             props.update({
                 "s1_image_count": s1_info["count"],
                 "s1_extra_days_used": s1_info["extra_days"],
@@ -164,7 +172,13 @@ def build_hybrid_features(region, cfg):
                 ).get("rain_total_mm")
                 return ee.Dictionary({"rain_total_mean_mm": rain_mean})
 
-            rain_dict = ee.Dictionary(ee.Algorithms.If(rain_info["found"], rain_metrics(), null_dict(["rain_total_mean_mm"])))
+            rain_dict = ee.Dictionary(
+                ee.Algorithms.If(
+                    rain_info["found"],
+                    rain_metrics(),
+                    null_dict(["rain_total_mean_mm"]),
+                )
+            )
             props.update({
                 "chirps_image_count": rain_info["count"],
                 "chirps_extra_days_used": rain_info["extra_days"],
@@ -184,7 +198,13 @@ def build_hybrid_features(region, cfg):
                 ).get("soil_moisture")
                 return ee.Dictionary({"soil_moisture_mean": smap_mean})
 
-            smap_dict = ee.Dictionary(ee.Algorithms.If(smap_info["found"], smap_metrics(), null_dict(["soil_moisture_mean"])))
+            smap_dict = ee.Dictionary(
+                ee.Algorithms.If(
+                    smap_info["found"],
+                    smap_metrics(),
+                    null_dict(["soil_moisture_mean"]),
+                )
+            )
             props.update({
                 "smap_image_count": smap_info["count"],
                 "smap_extra_days_used": smap_info["extra_days"],
@@ -209,7 +229,13 @@ def build_hybrid_features(region, cfg):
                 ).get("NDWI")
                 return ee.Dictionary({"ndwi_mean": ndwi_mean})
 
-            s2_dict = ee.Dictionary(ee.Algorithms.If(s2_info["found"], s2_metrics(), null_dict(["ndwi_mean"])))
+            s2_dict = ee.Dictionary(
+                ee.Algorithms.If(
+                    s2_info["found"],
+                    s2_metrics(),
+                    null_dict(["ndwi_mean"]),
+                )
+            )
             props.update({
                 "s2_image_count": s2_info["count"],
                 "s2_extra_days_used": s2_info["extra_days"],
@@ -224,14 +250,14 @@ def build_hybrid_features(region, cfg):
 
 with st.sidebar:
     st.header("1. Hybrid time design")
-    st.caption("Historical context is monthly. Only the current update period uses weekly intervals.")
+    st.caption("Historical context is monthly. The recent update period is previous month + current month using 7-day windows.")
     hist_start = st.text_input("Historical monthly start", "2018-01-01")
     hist_end = st.text_input("Historical monthly end", "2026-03-01")
-    update_start = st.text_input("Weekly update start", "2026-04-01")
-    update_end = st.text_input("Weekly update end", "2026-04-30")
-    weekly_step = st.select_slider("Update interval days", [6, 7, 8, 10, 14], value=7)
-    max_extra_days = st.slider("Auto-extend up to extra days if no data", 0, 30, 14)
-    st.caption("Example: if a 7-day Sentinel-1 window has no image, the app tries 8 days, 9 days, etc. until data appears or this limit is reached.")
+    update_start = st.text_input("Recent weekly update start", "2026-04-01")
+    update_end = st.text_input("Recent weekly update end", "2026-05-31")
+    weekly_step = 7
+    st.caption("Recent update interval is fixed at 7 days. If no data is found, the app tries 8, 9, and 10 days.")
+    max_extra_days = st.select_slider("Auto-extend if no data", options=[0, 1, 2, 3], value=3)
 
     st.divider()
     st.header("2. Area of Interest")
@@ -284,12 +310,12 @@ cfg = {
     "s2_cloud_pct": s2_cloud_pct,
 }
 
-period_rows = build_period_table(hist_start, hist_end, update_start, update_end, int(weekly_step))
+period_rows = build_period_table(hist_start, hist_end, update_start, update_end)
 region = ee.Geometry.Rectangle([xmin, ymin, xmax, ymax])
 
 c1, c2, c3 = st.columns(3)
-c1.metric("Historical monthly rows", len([r for r in period_rows if r["period_type"] == "historical_monthly"]))
-c2.metric("April weekly rows", len([r for r in period_rows if r["period_type"] == "april_2026_weekly_update"]))
+c1.metric("Historical monthly rows", len([r for r in period_rows if r["period_type"] == "historical_monthly_baseline"]))
+c2.metric("Recent 7-day rows", len([r for r in period_rows if r["period_type"] == "recent_7day_update"]))
 c3.metric("Total periods", len(period_rows))
 
 run_preview = st.button("Build hybrid monitoring preview", type="primary")
@@ -313,9 +339,9 @@ if export_drive:
         fc = build_hybrid_features(region, cfg)
         task = ee.batch.Export.table.toDrive(
             collection=fc,
-            description="hobart_hybrid_monthly_baseline_april2026_weekly_update",
+            description="hobart_hybrid_monthly_baseline_recent_weekly_update",
             folder="GEE_Hobart_Flood_Project",
-            fileNamePrefix="hobart_hybrid_monthly_baseline_april2026_weekly_update",
+            fileNamePrefix="hobart_hybrid_monthly_baseline_recent_weekly_update",
             fileFormat="CSV",
         )
         task.start()
@@ -332,7 +358,7 @@ if "hybrid_monitoring_df" in st.session_state:
     st.download_button(
         "Download preview CSV",
         df.to_csv(index=False).encode("utf-8"),
-        file_name="hybrid_monthly_baseline_april2026_weekly_update.csv",
+        file_name="hybrid_monthly_baseline_recent_weekly_update.csv",
         mime="text/csv",
     )
 
@@ -350,11 +376,10 @@ st.subheader("How this supports updated susceptibility mapping")
 st.markdown(
     """
 1. Use the monthly rows from 2018 to March 2026 as the historical baseline/context.
-2. Use the April 2026 weekly rows as the live update signal.
-3. Pick the April week with high rainfall, high SAR water-like area, or high soil moisture.
-4. Open **Dynamic Flood Susceptibility Trainer**.
-5. Use that April week as the target SAR label window and train a new updated susceptibility map.
-
-The columns ending in `_extra_days_used` show whether the app had to expand a period to find data.
+2. Use the recent 7-day rows from April 2026 through May 2026 as the current update signal.
+3. If a 7-day period has no data, the app checks 8, 9, and 10 days and records the extension in `_extra_days_used` columns.
+4. Pick the recent week with high rainfall, high SAR water-like area, or high soil moisture.
+5. Open **Dynamic Flood Susceptibility Trainer**.
+6. Use that recent week as the target SAR label window and train a new updated susceptibility map.
 """
 )
