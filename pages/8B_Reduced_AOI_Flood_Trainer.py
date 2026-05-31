@@ -22,17 +22,19 @@ from utils.gee_presets import DATASET_PRESETS
 
 DEFAULT_AOI_ASSET = "projects/gee-project-493107/assets/Study_Area"
 DEFAULT_BUILDING_ASSET = DATASET_PRESETS["Greater Hobart Buildings asset"]["id"]
-SKIP_LGA_CODE = 115
 
-st.set_page_config(page_title="Reduced AOI Flood Trainer", page_icon="🛰️", layout="wide")
-st.title("🛰️ Reduced AOI Flood Trainer")
-st.caption("Runs the dynamic flood susceptibility workflow using the Study_Area asset while skipping LGA_CODE 115 to reduce Earth Engine memory load.")
+st.set_page_config(page_title="Dynamic RF Building Exposure", page_icon="🛰️", layout="wide")
+st.title("🛰️ Dynamic Flood Susceptibility + Building Exposure")
+st.caption(
+    "Integrated version of the working GEE script: Study_Area asset, Huon Valley exclusion, "
+    "AOI masking, RF low/medium/high classes, and building counts by council."
+)
 show_ee_connection_block()
 
 with st.sidebar:
     st.header("AOI")
     aoi_asset = st.text_input("Study area polygon asset", DEFAULT_AOI_ASSET)
-    skip_lga_115 = st.checkbox("Skip LGA_CODE 115", value=True)
+    exclude_huon = st.checkbox("Exclude Huon Valley by NAME", value=True)
     simplify_m = st.slider("Simplify AOI geometry metres", 0, 1000, 100, 50)
 
     st.header("SAR dates")
@@ -75,6 +77,10 @@ with st.sidebar:
     seed = st.number_input("Random seed", 0, 9999, 42)
     susceptibility_weight = st.slider("Final overlay susceptibility weight", 0.0, 1.0, 0.70, 0.05)
     high_overlay_threshold = st.slider("High overlay threshold", 0.30, 0.90, 0.66, 0.01)
+
+    st.header("RF class thresholds")
+    low_max = st.slider("Low/Medium break", 0.10, 0.50, 0.33, 0.01)
+    medium_max = st.slider("Medium/High break", 0.50, 0.90, 0.66, 0.01)
     building_asset = st.text_input("Building asset", DEFAULT_BUILDING_ASSET)
 
 config = FloodConfig(
@@ -114,37 +120,99 @@ config = FloodConfig(
 )
 
 st.info(f"AOI asset: `{aoi_asset}`")
-st.info(f"Skip LGA_CODE 115: `{skip_lga_115}` | scale: `{scale}` m | samples/class: `{class_points}` | RF trees: `{rf_trees}`")
+st.info(f"Exclude Huon Valley: `{exclude_huon}` | scale: `{scale}` m | samples/class: `{class_points}` | RF trees: `{rf_trees}`")
 
-if st.button("Train reduced AOI model", type="primary", use_container_width=True):
-    with st.status("Running reduced AOI Earth Engine workflow...", expanded=True) as status:
+if st.button("Train dynamic RF model + building exposure", type="primary", use_container_width=True):
+    with st.status("Running Earth Engine workflow...", expanded=True) as status:
         try:
-            status.write("Preparing AOI...")
-            study_area_fc = ee.FeatureCollection(aoi_asset)
-            if skip_lga_115:
-                study_area_fc = study_area_fc.filter(ee.Filter.neq("LGA_CODE", SKIP_LGA_CODE))
+            status.write("Preparing Study_Area and AOI mask...")
+            study_area_fc_all = ee.FeatureCollection(aoi_asset)
+            study_area_fc = study_area_fc_all
+            if exclude_huon:
+                study_area_fc = study_area_fc.filter(ee.Filter.neq("NAME", "Huon Valley"))
             region = study_area_fc.geometry()
             if int(simplify_m) > 0:
                 region = region.simplify(int(simplify_m))
+
+            study_area_mask = ee.Image.constant(1).clip(region).selfMask()
 
             status.write("Building SAR layers...")
             pre_vv, during_vv, sar_change, pre_col, target_col, pre_info, target_info = get_s1_vv_event_change(
                 region, recovery_start, recovery_end, label_start, label_end, orbit, config.max_extra_days
             )
+            pre_vv = pre_vv.clip(region).updateMask(study_area_mask)
+            during_vv = during_vv.clip(region).updateMask(study_area_mask)
+            sar_change = sar_change.clip(region).updateMask(study_area_mask)
+
             status.write("Building existing-water mask...")
             ndwi, existing_water, water_info = get_s2_existing_water(region, config, return_info=True)
+            ndwi = ndwi.clip(region).updateMask(study_area_mask)
+            existing_water = existing_water.clip(region).updateMask(study_area_mask)
+
             status.write("Creating flood label and persistence layers...")
-            flood_map = build_change_flood_map(during_vv, sar_change, existing_water, config)
+            flood_map = build_change_flood_map(during_vv, sar_change, existing_water, config).clip(region).updateMask(study_area_mask)
             vv_change, stuck_water, persistence = build_persistence(pre_vv, during_vv, flood_map, config)
+            vv_change = vv_change.clip(region).updateMask(study_area_mask)
+            stuck_water = stuck_water.clip(region).updateMask(study_area_mask)
+            persistence = persistence.clip(region).updateMask(study_area_mask)
+
             status.write("Building predictors and training RF...")
             predictors, predictor_names, extra_layers = build_predictors(region, config)
+            predictors = predictors.clip(region).updateMask(study_area_mask).unmask(-9999).clip(region).updateMask(study_area_mask)
             rf_result = train_rf_susceptibility(region, predictors, flood_map, predictor_names, config)
-            susceptibility = rf_result["susceptibility"]
+            susceptibility = rf_result["susceptibility"].clip(region).updateMask(study_area_mask)
             final_overlay, high_overlay = build_final_overlay(susceptibility, stuck_water, config)
+            final_overlay = final_overlay.clip(region).updateMask(study_area_mask)
+            high_overlay = high_overlay.clip(region).updateMask(study_area_mask)
 
+            status.write("Classifying RF susceptibility into low / medium / high...")
+            rf_class = (
+                ee.Image(0)
+                .where(susceptibility.gte(0).And(susceptibility.lt(float(low_max))), 1)
+                .where(susceptibility.gte(float(low_max)).And(susceptibility.lt(float(medium_max))), 2)
+                .where(susceptibility.gte(float(medium_max)), 3)
+                .rename("rf_susceptibility_class")
+                .toInt()
+                .clip(region)
+                .updateMask(study_area_mask)
+            )
+
+            status.write("Counting buildings by RF class and council...")
+            buildings = ee.FeatureCollection(building_asset).filterBounds(region)
+            building_rf_class = rf_class.reduceRegions(
+                collection=buildings,
+                reducer=ee.Reducer.max(),
+                scale=config.scale,
+                tileScale=4,
+            ).filter(ee.Filter.notNull(["max"]))
+
+            building_rf_class = building_rf_class.map(lambda f: f.set("rf_class", f.get("max")))
+
+            def count_buildings_by_council(council):
+                council = ee.Feature(council)
+                council_geom = council.geometry()
+                council_name = council.get("NAME")
+                buildings_in_council = building_rf_class.filterBounds(council_geom)
+                low_count = buildings_in_council.filter(ee.Filter.eq("rf_class", 1)).size()
+                medium_count = buildings_in_council.filter(ee.Filter.eq("rf_class", 2)).size()
+                high_count = buildings_in_council.filter(ee.Filter.eq("rf_class", 3)).size()
+                total_count = buildings_in_council.size()
+                return ee.Feature(None, {
+                    "council": council_name,
+                    "low_buildings": low_count,
+                    "medium_buildings": medium_count,
+                    "high_buildings": high_count,
+                    "total_classified_buildings": total_count,
+                })
+
+            council_building_counts = study_area_fc.map(count_buildings_by_council)
+
+            status.write("Calculating metrics...")
             cm = rf_result["confusion_matrix"]
             metrics = {
                 "aoi_features": study_area_fc.size().getInfo(),
+                "total_buildings": buildings.size().getInfo(),
+                "classified_buildings": building_rf_class.size().getInfo(),
                 "pre_s1_count": pre_col.size().getInfo(),
                 "during_s1_count": target_col.size().getInfo(),
                 "accuracy": cm.accuracy().getInfo(),
@@ -154,18 +222,20 @@ if st.button("Train reduced AOI model", type="primary", use_container_width=True
                 "flood_area_km2": area_km2(flood_map, "Flood_Map", region, config.scale).getInfo(),
                 "stuck_water_km2": area_km2(stuck_water, "Stuck_Water", region, config.scale).getInfo(),
             }
-            status.update(label="Training complete", state="complete")
+            counts_features = council_building_counts.getInfo()["features"]
+            counts_df = pd.DataFrame([f["properties"] for f in counts_features])
+            status.update(label="Training and exposure analysis complete", state="complete")
         except Exception as exc:
-            status.update(label="Training failed", state="error")
+            status.update(label="Workflow failed", state="error")
             st.exception(exc)
             st.stop()
 
-    st.subheader("Results")
+    st.subheader("Model summary")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Accuracy", f"{metrics['accuracy']:.3f}")
     c2.metric("Kappa", f"{metrics['kappa']:.3f}")
     c3.metric("Flood area km²", f"{metrics['flood_area_km2']:.2f}")
-    c4.metric("Stuck water km²", f"{metrics['stuck_water_km2']:.2f}")
+    c4.metric("Buildings classified", f"{metrics['classified_buildings']:,}")
 
     st.write("AOI feature count used:", metrics["aoi_features"])
     st.write("SAR image counts:", {"pre_event": metrics["pre_s1_count"], "during_event": metrics["during_s1_count"]})
@@ -181,12 +251,40 @@ if st.button("Train reduced AOI model", type="primary", use_container_width=True
     except Exception as exc:
         st.warning(f"Could not render importance table: {exc}")
 
+    st.subheader("Buildings by RF susceptibility class and council")
+    if not counts_df.empty:
+        counts_df = counts_df.sort_values("high_buildings", ascending=False)
+        st.dataframe(counts_df, use_container_width=True)
+        chart_df = counts_df.melt(
+            id_vars=["council"],
+            value_vars=["low_buildings", "medium_buildings", "high_buildings"],
+            var_name="RF susceptibility class",
+            value_name="Number of buildings",
+        )
+        chart_df["RF susceptibility class"] = chart_df["RF susceptibility class"].replace({
+            "low_buildings": "Low",
+            "medium_buildings": "Medium",
+            "high_buildings": "High",
+        })
+        fig = px.bar(
+            chart_df,
+            x="council",
+            y="Number of buildings",
+            color="RF susceptibility class",
+            barmode="group",
+            title="Buildings by RF Flood Susceptibility Class and Council",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No council building-count rows were returned.")
+
     st.subheader("Map")
     m = hobart_map(zoom_start=9)
-    add_ee_layer(m, study_area_fc.style(color="red", fillColor="00000000", width=2), {}, "Reduced Study Area", True)
-    add_ee_layer(m, flood_map.selfMask(), get_default_vis("flood_map"), "SAR-change Flood Map", True)
+    add_ee_layer(m, study_area_fc.style(color="red", fillColor="00000000", width=2), {}, "Study Area Used", True)
+    add_ee_layer(m, flood_map.selfMask(), get_default_vis("flood_map"), "SAR-change Flood Map", False)
     add_ee_layer(m, susceptibility, get_default_vis("susceptibility"), "RF Flood Susceptibility", True)
-    add_ee_layer(m, final_overlay, get_default_vis("final_overlay"), "Final Overlay", True)
+    add_ee_layer(m, rf_class, {"min": 1, "max": 3, "palette": ["green", "yellow", "red"]}, "RF Classes Low Medium High", True)
+    add_ee_layer(m, final_overlay, get_default_vis("final_overlay"), "Final Overlay", False)
     add_ee_layer(m, high_overlay.selfMask(), get_default_vis("high_overlay"), "High Overlay Zone", False)
     if "river_distance" in extra_layers:
         add_ee_layer(m, extra_layers["river_distance"], get_default_vis("river_distance"), "River Distance", False)
@@ -195,4 +293,4 @@ if st.button("Train reduced AOI model", type="primary", use_container_width=True
     folium.LayerControl().add_to(m)
     st_folium(m, height=650, use_container_width=True)
 else:
-    st.caption("Default reduced settings: skip LGA_CODE 115, simplify 100 m, scale 250 m, 300 samples/class, 200 trees.")
+    st.caption("Default settings follow the working GEE editor code: exclude Huon Valley by NAME, mask outputs to Study_Area, classify RF into low/medium/high, and count buildings by council.")
