@@ -8,13 +8,26 @@
 
 
 // -----------------------------
-// 1. AOI
+// 1. AOI - Study Area Polygon Asset
 // -----------------------------
 
-var studyArea = ee.Geometry.Rectangle([146.85, -43.10, 147.55, -42.65]);
+// Your uploaded GEE study area polygon
+var studyAreaFC = ee.FeatureCollection(
+  'projects/sturdy-apricot-405823/assets/Study_Area'
+);
+
+// Convert FeatureCollection to geometry for clipping, filtering, sampling, and export
+var studyArea = studyAreaFC.geometry();
+
 var scale = 100;
 
-Map.centerObject(studyArea, 10);
+Map.centerObject(studyAreaFC, 10);
+
+Map.addLayer(studyAreaFC.style({
+  color: 'red',
+  fillColor: '00000000',
+  width: 2
+}), {}, 'Study Area Boundary');
 
 
 // -----------------------------
@@ -308,7 +321,7 @@ var samples = stack.stratifiedSample({
   numPoints: 0,
   classBand: 'label',
   classValues: [0, 1],
-  classPoints: [600, 600],
+  classPoints: [800, 1200],
   region: studyArea,
   scale: scale,
   seed: 42,
